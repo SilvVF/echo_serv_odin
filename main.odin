@@ -2,62 +2,100 @@ package main
 
 import "core:fmt"
 import "core:net"
-import "core:slice"
+import "core:strings"
+import "core:thread"
+
+is_ctrl_d :: proc(bytes: []u8) -> bool {
+	return len(bytes) == 1 && bytes[0] == 4
+}
+
+is_empty :: proc(bytes: []u8) -> bool {
+	return(
+		(len(bytes) == 2 && bytes[0] == '\r' && bytes[1] == '\n') ||
+		(len(bytes) == 1 && bytes[0] == '\n') \
+	)
+}
+
+is_telnet_ctrl_c :: proc(bytes: []u8) -> bool {
+	return(
+		(len(bytes) == 3 && bytes[0] == 255 && bytes[1] == 251 && bytes[2] == 6) ||
+		(len(bytes) == 5 &&
+				bytes[0] == 255 &&
+				bytes[1] == 244 &&
+				bytes[2] == 255 &&
+				bytes[3] == 253 &&
+				bytes[4] == 6) \
+	)
+}
+
 
 main :: proc() {
-
-	fmt.println("hererer")
-
-	sock, lisetnErr := net.listen_tcp({net.IP4_Loopback, 8080})
-	if lisetnErr != nil {
-		panic("couldnt listen on to tcp")
+	endpoint := net.Endpoint {
+		address = net.IP4_Loopback,
+		port    = 8080,
 	}
-
-	client, source, err := net.accept_tcp(sock)
+	sock, err := net.listen_tcp({net.IP4_Loopback, 8080})
 	if err != nil {
-		fmt.printfln("Couldnt accept tcp %v, %v %e", client, source, err)
+		fmt.println("Failed to listen on TCP")
+		return
 	}
-	fmt.printfln("Accepted tcp %v, %v", client, source)
-	buf := make_slice([]byte, 1024)
-	fmt.printfln("len buf: %d", len(buf))
 
-	arr := make([]byte, len("escape character esc"))
-	i := 0
-	for c in "escape character esc" {
-		arr[i] = u8(c)
-		i += 1
-	}
-	net.send_tcp(client, arr)
-	net.send_tcp(client, []byte{'\r', '\n'})
+	defer net.close(sock)
 
-	c := 0
+	fmt.println(strings.concatenate({"Listening on TCP: ", net.endpoint_to_string(endpoint)}))
 	for {
 
-		read, err1 := net.recv_tcp(client, buf[c:])
-		c += read
+		conn, _, err_accept := net.accept_tcp(sock)
 
-		if read == 0 || err1 != nil {
-			continue
+		if err_accept != nil {
+			fmt.println("Failed to accept TCP connection")
 		}
 
-		fmt.printfln("%d", c)
-		fmt.println(string(buf[:c]))
+		thread.create_and_start_with_poly_data(conn, proc(data: net.TCP_Socket) {
 
-		if buf[c - 1] == '\e' {
-			net.close(client)
-			break
-		}
+			defer net.close(data)
 
-		if c < 2 {
-			continue
-		}
 
-		if string(buf[c - 2:c]) == "\r\n" {
-			fmt.printf("read %s", string(buf[:c]))
-			net.send_tcp(client, []byte{'\r', '\n'})
-			net.send_tcp(client, buf[:c])
-			slice.fill(buf, 0)
-			c = 0
-		}
+			buf := [1024]u8{}
+			offset := 0
+
+			for {
+
+				bytes := net.recv_tcp(data, buf[offset:]) or_break
+
+				if bytes <= 0 {
+					continue
+				}
+
+				offset += bytes
+				recv := buf[offset - bytes:offset]
+
+				fmt.printfln("Server received [ %d bytes ]: %s", len(recv), recv)
+
+				if is_ctrl_d(recv) || is_telnet_ctrl_c(recv) {
+					fmt.println("Disconnecting client")
+					break
+				}
+
+				if !is_empty(recv) {
+					continue
+				}
+
+				new_buf := make([]u8, offset + 2)
+				copy(new_buf[0:], "\r\n")
+				copy(new_buf[2:], buf[:offset])
+				sent, err_send := net.send_tcp(data, new_buf)
+
+				if err_send != nil {
+					fmt.println("Failed to send data")
+				}
+				sent_msg := buf[:sent]
+
+				fmt.printfln("Server sent [ %d bytes ]: %s", len(sent_msg), sent_msg)
+
+
+				offset = 0
+			}
+		})
 	}
 }
